@@ -1,0 +1,315 @@
+/*
+  ============================================================
+  4-Lane Traffic Signal — Opposite Lanes Paired
+  + Phase 1: Lane 1 (North) + Lane 3 (South) GREEN together
+  + Phase 2: Lane 2 (East)  + Lane 4 (West)  GREEN together
+  + Delta-based sound detection — loudest spike wins
+  + Emergency: only triggered lane gets green (opposite RED)
+  + Cooldown 15 seconds
+  ============================================================
+  Lane 1 (North): RED=2,  YELLOW=3,  GREEN=4   | Sound → A0
+  Lane 2 (East):  RED=5,  YELLOW=6,  GREEN=7   | Sound → A1
+  Lane 3 (South): RED=8,  YELLOW=9,  GREEN=10  | Sound → A2
+  Lane 4 (West):  RED=11, YELLOW=12, GREEN=13  | Sound → A3
+  ============================================================
+*/
+
+// ── Lane Pins ─────────────────────────────────────────────
+const int L1_RED=2,  L1_YELLOW=3,  L1_GREEN=4;
+const int L2_RED=5,  L2_YELLOW=6,  L2_GREEN=7;
+const int L3_RED=8,  L3_YELLOW=9,  L3_GREEN=10;
+const int L4_RED=11, L4_YELLOW=12, L4_GREEN=13;
+
+// ── Sound Sensor Pins ─────────────────────────────────────
+const int S1=A0, S2=A1, S3=A2, S4=A3;
+
+// ── Delta threshold — tune if false triggers happen ───────
+const int DELTA_THRESHOLD = 10;
+
+// ── Timing ────────────────────────────────────────────────
+const unsigned long GREEN_DURATION   = 5000;
+const unsigned long YELLOW_DURATION  = 2000;
+const unsigned long ALL_RED_DURATION = 1000;
+const unsigned long SOUND_GREEN_TIME = 3000;
+const unsigned long COOLDOWN_TIME    = 15000;
+
+// ── Previous sensor readings for delta ────────────────────
+int prev1=0, prev2=0, prev3=0, prev4=0;
+
+// ── States ────────────────────────────────────────────────
+// Normal: 2 phases (NS and EW) with yellow + all-red
+// Emergency: 4 individual lane overrides
+enum TrafficState {
+  // Phase 1 — North + South
+  NS_GREEN,
+  NS_YELLOW,
+  ALL_RED_1,
+
+  // Phase 2 — East + West
+  EW_GREEN,
+  EW_YELLOW,
+  ALL_RED_2,
+
+  // Emergency overrides (single lane only)
+  OVERRIDE_1,   // North only
+  OVERRIDE_2,   // East only
+  OVERRIDE_3,   // South only
+  OVERRIDE_4    // West only
+};
+
+const char* stateNames[] = {
+  "NS_GREEN", "NS_YELLOW", "ALL_RED_1",
+  "EW_GREEN", "EW_YELLOW", "ALL_RED_2",
+  "OVERRIDE_1(North)",
+  "OVERRIDE_2(East)",
+  "OVERRIDE_3(South)",
+  "OVERRIDE_4(West)"
+};
+
+TrafficState currentState = NS_GREEN;
+unsigned long stateStartTime = 0;
+unsigned long cooldownStart  = 0;
+bool cooldownActive          = false;
+
+// ── All LEDs off ──────────────────────────────────────────
+void allOff() {
+  digitalWrite(L1_RED,LOW); digitalWrite(L1_YELLOW,LOW); digitalWrite(L1_GREEN,LOW);
+  digitalWrite(L2_RED,LOW); digitalWrite(L2_YELLOW,LOW); digitalWrite(L2_GREEN,LOW);
+  digitalWrite(L3_RED,LOW); digitalWrite(L3_YELLOW,LOW); digitalWrite(L3_GREEN,LOW);
+  digitalWrite(L4_RED,LOW); digitalWrite(L4_YELLOW,LOW); digitalWrite(L4_GREEN,LOW);
+}
+
+// ── All lanes RED ─────────────────────────────────────────
+void allRed() {
+  allOff();
+  digitalWrite(L1_RED,HIGH); digitalWrite(L2_RED,HIGH);
+  digitalWrite(L3_RED,HIGH); digitalWrite(L4_RED,HIGH);
+}
+
+// ── Apply state ───────────────────────────────────────────
+void applyState(TrafficState state) {
+  allOff();
+  switch(state) {
+
+    // ── All RED clearance ─────────────────────────────────
+    case ALL_RED_1:
+    case ALL_RED_2:
+      allRed();
+      break;
+
+    // ── Phase 1: North + South GREEN ─────────────────────
+    case NS_GREEN:
+      digitalWrite(L1_GREEN,HIGH);  // North green
+      digitalWrite(L3_GREEN,HIGH);  // South green
+      digitalWrite(L2_RED,HIGH);    // East red
+      digitalWrite(L4_RED,HIGH);    // West red
+      break;
+
+    // ── Phase 1: North + South YELLOW ────────────────────
+    case NS_YELLOW:
+      digitalWrite(L1_YELLOW,HIGH); // North yellow
+      digitalWrite(L3_YELLOW,HIGH); // South yellow
+      digitalWrite(L2_RED,HIGH);    // East red
+      digitalWrite(L4_RED,HIGH);    // West red
+      break;
+
+    // ── Phase 2: East + West GREEN ────────────────────────
+    case EW_GREEN:
+      digitalWrite(L2_GREEN,HIGH);  // East green
+      digitalWrite(L4_GREEN,HIGH);  // West green
+      digitalWrite(L1_RED,HIGH);    // North red
+      digitalWrite(L3_RED,HIGH);    // South red
+      break;
+
+    // ── Phase 2: East + West YELLOW ───────────────────────
+    case EW_YELLOW:
+      digitalWrite(L2_YELLOW,HIGH); // East yellow
+      digitalWrite(L4_YELLOW,HIGH); // West yellow
+      digitalWrite(L1_RED,HIGH);    // North red
+      digitalWrite(L3_RED,HIGH);    // South red
+      break;
+
+    // ── Emergency: North only ─────────────────────────────
+    case OVERRIDE_1:
+      digitalWrite(L1_GREEN,HIGH);  // North green
+      digitalWrite(L2_RED,HIGH);    // East red
+      digitalWrite(L3_RED,HIGH);    // South red (opposite stays RED)
+      digitalWrite(L4_RED,HIGH);    // West red
+      break;
+
+    // ── Emergency: East only ──────────────────────────────
+    case OVERRIDE_2:
+      digitalWrite(L2_GREEN,HIGH);  // East green
+      digitalWrite(L1_RED,HIGH);    // North red
+      digitalWrite(L3_RED,HIGH);    // South red
+      digitalWrite(L4_RED,HIGH);    // West red (opposite stays RED)
+      break;
+
+    // ── Emergency: South only ─────────────────────────────
+    case OVERRIDE_3:
+      digitalWrite(L3_GREEN,HIGH);  // South green
+      digitalWrite(L1_RED,HIGH);    // North red (opposite stays RED)
+      digitalWrite(L2_RED,HIGH);    // East red
+      digitalWrite(L4_RED,HIGH);    // West red
+      break;
+
+    // ── Emergency: West only ──────────────────────────────
+    case OVERRIDE_4:
+      digitalWrite(L4_GREEN,HIGH);  // West green
+      digitalWrite(L1_RED,HIGH);    // North red
+      digitalWrite(L2_RED,HIGH);    // East red
+      digitalWrite(L3_RED,HIGH);    // South red (opposite stays RED)
+      break;
+  }
+}
+
+// ── Transition to new state ───────────────────────────────
+void transitionTo(TrafficState newState) {
+  currentState   = newState;
+  stateStartTime = millis();
+  applyState(newState);
+  Serial.print("[State] → ");
+  Serial.println(stateNames[newState]);
+}
+
+// ── Is triggered lane already green? ─────────────────────
+bool isLaneGreen(int lane) {
+  if(lane==1) return(currentState==NS_GREEN || currentState==OVERRIDE_1);
+  if(lane==2) return(currentState==EW_GREEN || currentState==OVERRIDE_2);
+  if(lane==3) return(currentState==NS_GREEN || currentState==OVERRIDE_3);
+  if(lane==4) return(currentState==EW_GREEN || currentState==OVERRIDE_4);
+  return false;
+}
+
+// ── Get override state for lane ───────────────────────────
+TrafficState getOverrideState(int lane) {
+  if(lane==1) return OVERRIDE_1;
+  if(lane==2) return OVERRIDE_2;
+  if(lane==3) return OVERRIDE_3;
+  return OVERRIDE_4;
+}
+
+// ── Get yellow state to resume after override ─────────────
+TrafficState getResumeState(int lane) {
+  // After emergency, resume with that pair's yellow
+  if(lane==1 || lane==3) return NS_YELLOW;
+  return EW_YELLOW;
+}
+
+// ─────────────────────────────────────────────────────────
+void setup() {
+  pinMode(L1_RED,OUTPUT); pinMode(L1_YELLOW,OUTPUT); pinMode(L1_GREEN,OUTPUT);
+  pinMode(L2_RED,OUTPUT); pinMode(L2_YELLOW,OUTPUT); pinMode(L2_GREEN,OUTPUT);
+  pinMode(L3_RED,OUTPUT); pinMode(L3_YELLOW,OUTPUT); pinMode(L3_GREEN,OUTPUT);
+  pinMode(L4_RED,OUTPUT); pinMode(L4_YELLOW,OUTPUT); pinMode(L4_GREEN,OUTPUT);
+
+  pinMode(S1,INPUT); pinMode(S2,INPUT);
+  pinMode(S3,INPUT); pinMode(S4,INPUT);
+
+  // Warm up sensors
+  prev1=analogRead(S1); prev2=analogRead(S2);
+  prev3=analogRead(S3); prev4=analogRead(S4);
+  delay(100);
+
+  Serial.begin(9600);
+  Serial.println("4-Lane Traffic System Ready.");
+  Serial.println("Normal: N+S together | E+W together");
+  Serial.println("Emergency: triggered lane only, opposite stays RED");
+  transitionTo(NS_GREEN);
+}
+
+// ─────────────────────────────────────────────────────────
+void loop() {
+  unsigned long now     = millis();
+  unsigned long elapsed = now - stateStartTime;
+
+  // STEP 1 — Cooldown check
+  if(cooldownActive) {
+    if(now - cooldownStart >= COOLDOWN_TIME) {
+      cooldownActive = false;
+      Serial.println("Cooldown over. Ready.");
+    }
+  }
+
+  // STEP 2 — Read sensors
+  int s1=analogRead(S1), s2=analogRead(S2);
+  int s3=analogRead(S3), s4=analogRead(S4);
+
+  // STEP 3 — Calculate delta from last reading
+  int d1=abs(s1-prev1), d2=abs(s2-prev2);
+  int d3=abs(s3-prev3), d4=abs(s4-prev4);
+
+  prev1=s1; prev2=s2; prev3=s3; prev4=s4;
+
+  // STEP 4 — Find biggest delta
+  if(!cooldownActive) {
+    int maxDelta=DELTA_THRESHOLD;
+    int triggeredLane=0;
+
+    if(d1>maxDelta) { maxDelta=d1; triggeredLane=1; }
+    if(d2>maxDelta) { maxDelta=d2; triggeredLane=2; }
+    if(d3>maxDelta) { maxDelta=d3; triggeredLane=3; }
+    if(d4>maxDelta) { maxDelta=d4; triggeredLane=4; }
+
+    if(triggeredLane>0) {
+      Serial.print("Delta → D1:"); Serial.print(d1);
+      Serial.print(" D2:"); Serial.print(d2);
+      Serial.print(" D3:"); Serial.print(d3);
+      Serial.print(" D4:"); Serial.println(d4);
+
+      if(!isLaneGreen(triggeredLane)) {
+        Serial.print("Emergency! Lane ");
+        Serial.print(triggeredLane);
+        Serial.print(" (delta:+"); Serial.print(maxDelta);
+        Serial.println(") → Single lane GREEN 3sec");
+
+        cooldownActive=true;
+        cooldownStart=now;
+        transitionTo(getOverrideState(triggeredLane));
+        return;
+
+      } else {
+        Serial.print("Lane ");
+        Serial.print(triggeredLane);
+        Serial.println(" already green. Ignored.");
+      }
+    }
+
+  } else {
+    if(d1>DELTA_THRESHOLD || d2>DELTA_THRESHOLD ||
+       d3>DELTA_THRESHOLD || d4>DELTA_THRESHOLD) {
+      unsigned long rem=(COOLDOWN_TIME-(now-cooldownStart))/1000;
+      Serial.print("Sound ignored. Cooldown: ");
+      Serial.print(rem); Serial.println("s left.");
+    }
+  }
+
+  // STEP 5 — State machine
+  switch(currentState) {
+
+    // ── Normal cycle ──────────────────────────────────────
+    case NS_GREEN:
+      if(elapsed>=GREEN_DURATION)   transitionTo(NS_YELLOW);   break;
+    case NS_YELLOW:
+      if(elapsed>=YELLOW_DURATION)  transitionTo(ALL_RED_1);   break;
+    case ALL_RED_1:
+      if(elapsed>=ALL_RED_DURATION) transitionTo(EW_GREEN);    break;
+
+    case EW_GREEN:
+      if(elapsed>=GREEN_DURATION)   transitionTo(EW_YELLOW);   break;
+    case EW_YELLOW:
+      if(elapsed>=YELLOW_DURATION)  transitionTo(ALL_RED_2);   break;
+    case ALL_RED_2:
+      if(elapsed>=ALL_RED_DURATION) transitionTo(NS_GREEN);    break;
+
+    // ── Emergency overrides ───────────────────────────────
+    case OVERRIDE_1:
+      if(elapsed>=SOUND_GREEN_TIME) transitionTo(NS_YELLOW);   break;
+    case OVERRIDE_2:
+      if(elapsed>=SOUND_GREEN_TIME) transitionTo(EW_YELLOW);   break;
+    case OVERRIDE_3:
+      if(elapsed>=SOUND_GREEN_TIME) transitionTo(NS_YELLOW);   break;
+    case OVERRIDE_4:
+      if(elapsed>=SOUND_GREEN_TIME) transitionTo(EW_YELLOW);   break;
+  }
+}

@@ -1,0 +1,378 @@
+/*
+ ============================================================
+  4-Lane Traffic Signal using INTERRUPTS
+  + Digital sound detection
+  + External interrupts
+  + Emergency lane priority
+ ============================================================
+
+ Lane 1 → Sound Sensor DO → Pin 18
+ Lane 2 → Sound Sensor DO → Pin 19
+ Lane 3 → Sound Sensor DO → Pin 20
+ Lane 4 → Sound Sensor DO → Pin 21
+
+ NOTE:
+ - Use DIGITAL OUTPUT (DO) pin of sound sensor
+ - Best for Arduino Mega
+ - For Arduino Uno only pins 2 and 3 support interrupts
+ ============================================================
+*/
+
+// ── Traffic LED Pins ──────────────────────────────────────
+const int L1_RED=2,  L1_YELLOW=3,  L1_GREEN=4;
+const int L2_RED=5,  L2_YELLOW=6,  L2_GREEN=7;
+const int L3_RED=8,  L3_YELLOW=9,  L3_GREEN=10;
+const int L4_RED=11, L4_YELLOW=12, L4_GREEN=13;
+
+// ── Sound Sensor Interrupt Pins ───────────────────────────
+const int S1 = 18;
+const int S2 = 19;
+const int S3 = 20;
+const int S4 = 21;
+
+// ── Timing ────────────────────────────────────────────────
+const unsigned long GREEN_DURATION   = 5000;
+const unsigned long YELLOW_DURATION  = 2000;
+const unsigned long ALL_RED_DURATION = 1000;
+const unsigned long EMERGENCY_TIME   = 3000;
+const unsigned long COOLDOWN_TIME    = 5000;
+
+// ── Interrupt Variables ───────────────────────────────────
+volatile int emergencyLane = 0;
+volatile bool interruptTriggered = false;
+
+// ── Cooldown ──────────────────────────────────────────────
+bool cooldownActive = false;
+unsigned long cooldownStart = 0;
+
+// ── States ────────────────────────────────────────────────
+enum TrafficState {
+  LANE1_GREEN, LANE1_YELLOW, ALL_RED_1,
+  LANE2_GREEN, LANE2_YELLOW, ALL_RED_2,
+  LANE3_GREEN, LANE3_YELLOW, ALL_RED_3,
+  LANE4_GREEN, LANE4_YELLOW, ALL_RED_4,
+  EMERGENCY_1, EMERGENCY_2,
+  EMERGENCY_3, EMERGENCY_4
+};
+
+TrafficState currentState = LANE1_GREEN;
+unsigned long stateStartTime = 0;
+
+// ── ALL OFF ───────────────────────────────────────────────
+void allOff() {
+
+  digitalWrite(L1_RED,LOW);
+  digitalWrite(L1_YELLOW,LOW);
+  digitalWrite(L1_GREEN,LOW);
+
+  digitalWrite(L2_RED,LOW);
+  digitalWrite(L2_YELLOW,LOW);
+  digitalWrite(L2_GREEN,LOW);
+
+  digitalWrite(L3_RED,LOW);
+  digitalWrite(L3_YELLOW,LOW);
+  digitalWrite(L3_GREEN,LOW);
+
+  digitalWrite(L4_RED,LOW);
+  digitalWrite(L4_YELLOW,LOW);
+  digitalWrite(L4_GREEN,LOW);
+}
+
+// ── ALL RED ───────────────────────────────────────────────
+void allRed() {
+
+  allOff();
+
+  digitalWrite(L1_RED,HIGH);
+  digitalWrite(L2_RED,HIGH);
+  digitalWrite(L3_RED,HIGH);
+  digitalWrite(L4_RED,HIGH);
+}
+
+// ── APPLY STATE ───────────────────────────────────────────
+void applyState(TrafficState state) {
+
+  allOff();
+
+  switch(state) {
+
+    case ALL_RED_1:
+    case ALL_RED_2:
+    case ALL_RED_3:
+    case ALL_RED_4:
+      allRed();
+      break;
+
+    case LANE1_GREEN:
+    case EMERGENCY_1:
+      digitalWrite(L1_GREEN,HIGH);
+      digitalWrite(L2_RED,HIGH);
+      digitalWrite(L3_RED,HIGH);
+      digitalWrite(L4_RED,HIGH);
+      break;
+
+    case LANE1_YELLOW:
+      digitalWrite(L1_YELLOW,HIGH);
+      digitalWrite(L2_RED,HIGH);
+      digitalWrite(L3_RED,HIGH);
+      digitalWrite(L4_RED,HIGH);
+      break;
+
+    case LANE2_GREEN:
+    case EMERGENCY_2:
+      digitalWrite(L2_GREEN,HIGH);
+      digitalWrite(L1_RED,HIGH);
+      digitalWrite(L3_RED,HIGH);
+      digitalWrite(L4_RED,HIGH);
+      break;
+
+    case LANE2_YELLOW:
+      digitalWrite(L2_YELLOW,HIGH);
+      digitalWrite(L1_RED,HIGH);
+      digitalWrite(L3_RED,HIGH);
+      digitalWrite(L4_RED,HIGH);
+      break;
+
+    case LANE3_GREEN:
+    case EMERGENCY_3:
+      digitalWrite(L3_GREEN,HIGH);
+      digitalWrite(L1_RED,HIGH);
+      digitalWrite(L2_RED,HIGH);
+      digitalWrite(L4_RED,HIGH);
+      break;
+
+    case LANE3_YELLOW:
+      digitalWrite(L3_YELLOW,HIGH);
+      digitalWrite(L1_RED,HIGH);
+      digitalWrite(L2_RED,HIGH);
+      digitalWrite(L4_RED,HIGH);
+      break;
+
+    case LANE4_GREEN:
+    case EMERGENCY_4:
+      digitalWrite(L4_GREEN,HIGH);
+      digitalWrite(L1_RED,HIGH);
+      digitalWrite(L2_RED,HIGH);
+      digitalWrite(L3_RED,HIGH);
+      break;
+
+    case LANE4_YELLOW:
+      digitalWrite(L4_YELLOW,HIGH);
+      digitalWrite(L1_RED,HIGH);
+      digitalWrite(L2_RED,HIGH);
+      digitalWrite(L3_RED,HIGH);
+      break;
+  }
+}
+
+// ── TRANSITION ────────────────────────────────────────────
+void transitionTo(TrafficState newState) {
+
+  currentState = newState;
+  stateStartTime = millis();
+
+  applyState(newState);
+
+  Serial.print("STATE → ");
+  Serial.println(newState);
+}
+
+// ── INTERRUPT SERVICE ROUTINES ────────────────────────────
+void ISR_LANE1() {
+
+  if(!cooldownActive) {
+    emergencyLane = 1;
+    interruptTriggered = true;
+  }
+}
+
+void ISR_LANE2() {
+
+  if(!cooldownActive) {
+    emergencyLane = 2;
+    interruptTriggered = true;
+  }
+}
+
+void ISR_LANE3() {
+
+  if(!cooldownActive) {
+    emergencyLane = 3;
+    interruptTriggered = true;
+  }
+}
+
+void ISR_LANE4() {
+
+  if(!cooldownActive) {
+    emergencyLane = 4;
+    interruptTriggered = true;
+  }
+}
+
+// ── GET EMERGENCY STATE ───────────────────────────────────
+TrafficState getEmergencyState(int lane) {
+
+  if(lane==1) return EMERGENCY_1;
+  if(lane==2) return EMERGENCY_2;
+  if(lane==3) return EMERGENCY_3;
+
+  return EMERGENCY_4;
+}
+
+// ── SETUP ─────────────────────────────────────────────────
+void setup() {
+
+  Serial.begin(9600);
+
+  pinMode(L1_RED,OUTPUT);
+  pinMode(L1_YELLOW,OUTPUT);
+  pinMode(L1_GREEN,OUTPUT);
+
+  pinMode(L2_RED,OUTPUT);
+  pinMode(L2_YELLOW,OUTPUT);
+  pinMode(L2_GREEN,OUTPUT);
+
+  pinMode(L3_RED,OUTPUT);
+  pinMode(L3_YELLOW,OUTPUT);
+  pinMode(L3_GREEN,OUTPUT);
+
+  pinMode(L4_RED,OUTPUT);
+  pinMode(L4_YELLOW,OUTPUT);
+  pinMode(L4_GREEN,OUTPUT);
+
+  pinMode(S1,INPUT);
+  pinMode(S2,INPUT);
+  pinMode(S3,INPUT);
+  pinMode(S4,INPUT);
+
+  // ── INTERRUPTS ─────────────────────────────────────────
+  attachInterrupt(digitalPinToInterrupt(S1), ISR_LANE1, RISING);
+  attachInterrupt(digitalPinToInterrupt(S2), ISR_LANE2, RISING);
+  attachInterrupt(digitalPinToInterrupt(S3), ISR_LANE3, RISING);
+  attachInterrupt(digitalPinToInterrupt(S4), ISR_LANE4, RISING);
+
+  Serial.println("Interrupt Traffic System Started");
+
+  transitionTo(LANE1_GREEN);
+}
+
+// ── LOOP ──────────────────────────────────────────────────
+void loop() {
+
+  unsigned long now = millis();
+  unsigned long elapsed = now - stateStartTime;
+
+  // ── COOLDOWN CHECK ─────────────────────────────────────
+  if(cooldownActive) {
+
+    if(now - cooldownStart >= COOLDOWN_TIME) {
+
+      cooldownActive = false;
+      Serial.println("Cooldown finished");
+    }
+  }
+
+  // ── INTERRUPT DETECTED ─────────────────────────────────
+  if(interruptTriggered) {
+
+    interruptTriggered = false;
+
+    Serial.print("Emergency detected on Lane ");
+    Serial.println(emergencyLane);
+
+    cooldownActive = true;
+    cooldownStart = now;
+
+    allRed();
+    delay(1000);
+
+    transitionTo(getEmergencyState(emergencyLane));
+
+    return;
+  }
+
+  // ── NORMAL STATE MACHINE ───────────────────────────────
+  switch(currentState) {
+
+    case EMERGENCY_1:
+      if(elapsed >= EMERGENCY_TIME)
+        transitionTo(LANE1_YELLOW);
+      break;
+
+    case EMERGENCY_2:
+      if(elapsed >= EMERGENCY_TIME)
+        transitionTo(LANE2_YELLOW);
+      break;
+
+    case EMERGENCY_3:
+      if(elapsed >= EMERGENCY_TIME)
+        transitionTo(LANE3_YELLOW);
+      break;
+
+    case EMERGENCY_4:
+      if(elapsed >= EMERGENCY_TIME)
+        transitionTo(LANE4_YELLOW);
+      break;
+
+    case LANE1_GREEN:
+      if(elapsed >= GREEN_DURATION)
+        transitionTo(LANE1_YELLOW);
+      break;
+
+    case LANE1_YELLOW:
+      if(elapsed >= YELLOW_DURATION)
+        transitionTo(ALL_RED_1);
+      break;
+
+    case ALL_RED_1:
+      if(elapsed >= ALL_RED_DURATION)
+        transitionTo(LANE2_GREEN);
+      break;
+
+    case LANE2_GREEN:
+      if(elapsed >= GREEN_DURATION)
+        transitionTo(LANE2_YELLOW);
+      break;
+
+    case LANE2_YELLOW:
+      if(elapsed >= YELLOW_DURATION)
+        transitionTo(ALL_RED_2);
+      break;
+
+    case ALL_RED_2:
+      if(elapsed >= ALL_RED_DURATION)
+        transitionTo(LANE3_GREEN);
+      break;
+
+    case LANE3_GREEN:
+      if(elapsed >= GREEN_DURATION)
+        transitionTo(LANE3_YELLOW);
+      break;
+
+    case LANE3_YELLOW:
+      if(elapsed >= YELLOW_DURATION)
+        transitionTo(ALL_RED_3);
+      break;
+
+    case ALL_RED_3:
+      if(elapsed >= ALL_RED_DURATION)
+        transitionTo(LANE4_GREEN);
+      break;
+
+    case LANE4_GREEN:
+      if(elapsed >= GREEN_DURATION)
+        transitionTo(LANE4_YELLOW);
+      break;
+
+    case LANE4_YELLOW:
+      if(elapsed >= YELLOW_DURATION)
+        transitionTo(ALL_RED_4);
+      break;
+
+    case ALL_RED_4:
+      if(elapsed >= ALL_RED_DURATION)
+        transitionTo(LANE1_GREEN);
+      break;
+  }
+}

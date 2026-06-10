@@ -1,0 +1,406 @@
+#include "arduinoFFT.h"
+
+// ============================================================
+// FFT SETTINGS (upgraded from filter code)
+// ============================================================
+
+#define SAMPLES             128       // was 64
+#define SAMPLING_FREQUENCY  12000     // was 8000
+
+double vReal[SAMPLES];
+double vImag[SAMPLES];
+
+ArduinoFFT<double> FFT = ArduinoFFT<double>(vReal, vImag, SAMPLES, SAMPLING_FREQUENCY);
+
+unsigned int sampling_period_us;
+
+// ============================================================
+// SIREN DETECTION RANGE
+// ============================================================
+
+const double SIREN_LOW       = 1000.0;   // tightened from 800
+const double SIREN_HIGH      = 1500.0;   // tightened from 1800
+const double SIREN_THRESHOLD = 300.0;
+
+// ============================================================
+// LANE 1 (NORTH)
+// ============================================================
+
+const int L1_RED    = 12;
+const int L1_YELLOW = 13;
+const int L1_GREEN  = 14;
+
+// ============================================================
+// LANE 2 (WEST)
+// ============================================================
+
+const int L2_RED    = 32;
+const int L2_YELLOW = 33;
+const int L2_GREEN  = 4;
+
+// ============================================================
+// LANE 3 (SOUTH)
+// ============================================================
+
+const int L3_RED    = 25;
+const int L3_YELLOW = 26;
+const int L3_GREEN  = 27;
+
+// ============================================================
+// LANE 4 (EAST)
+// ============================================================
+
+const int L4_RED    = 18;
+const int L4_YELLOW = 19;
+const int L4_GREEN  = 21;
+
+// ============================================================
+// MICROPHONE PINS (ADC ONLY)
+// ============================================================
+
+const int MIC1 = 34;
+const int MIC2 = 35;
+const int MIC3 = 36;
+const int MIC4 = 39;
+
+// ============================================================
+// TIMING
+// ============================================================
+
+const unsigned long GREEN_DURATION    = 5000;
+const unsigned long YELLOW_DURATION   = 2000;
+const unsigned long ALL_RED_DURATION  = 1000;
+const unsigned long EMERGENCY_TIME    = 5000;
+const unsigned long COOLDOWN_TIME     = 15000;
+
+// ============================================================
+// STATES
+// ============================================================
+
+enum TrafficState {
+  NS_GREEN,
+  NS_YELLOW,
+  ALL_RED_1,
+  EW_GREEN,
+  EW_YELLOW,
+  ALL_RED_2,
+  OVERRIDE_1,
+  OVERRIDE_2,
+  OVERRIDE_3,
+  OVERRIDE_4
+};
+
+TrafficState  currentState  = NS_GREEN;
+unsigned long stateStartTime = 0;
+unsigned long cooldownStart  = 0;
+bool          cooldownActive = false;
+
+// ============================================================
+// ALL OFF
+// ============================================================
+
+void allOff() {
+  digitalWrite(L1_RED,    LOW);
+  digitalWrite(L1_YELLOW, LOW);
+  digitalWrite(L1_GREEN,  LOW);
+  digitalWrite(L2_RED,    LOW);
+  digitalWrite(L2_YELLOW, LOW);
+  digitalWrite(L2_GREEN,  LOW);
+  digitalWrite(L3_RED,    LOW);
+  digitalWrite(L3_YELLOW, LOW);
+  digitalWrite(L3_GREEN,  LOW);
+  digitalWrite(L4_RED,    LOW);
+  digitalWrite(L4_YELLOW, LOW);
+  digitalWrite(L4_GREEN,  LOW);
+}
+
+// ============================================================
+// ALL RED
+// ============================================================
+
+void allRed() {
+  allOff();
+  digitalWrite(L1_RED, HIGH);
+  digitalWrite(L2_RED, HIGH);
+  digitalWrite(L3_RED, HIGH);
+  digitalWrite(L4_RED, HIGH);
+}
+
+// ============================================================
+// APPLY STATE
+// ============================================================
+
+void applyState(TrafficState state) {
+  allOff();
+
+  switch (state) {
+
+    case ALL_RED_1:
+    case ALL_RED_2:
+      allRed();
+      break;
+
+    // NORTH + SOUTH
+    case NS_GREEN:
+      digitalWrite(L1_GREEN, HIGH);
+      digitalWrite(L3_GREEN, HIGH);
+      digitalWrite(L2_RED,   HIGH);
+      digitalWrite(L4_RED,   HIGH);
+      break;
+
+    case NS_YELLOW:
+      digitalWrite(L1_YELLOW, HIGH);
+      digitalWrite(L3_YELLOW, HIGH);
+      digitalWrite(L2_RED,    HIGH);
+      digitalWrite(L4_RED,    HIGH);
+      break;
+
+    // WEST + EAST
+    case EW_GREEN:
+      digitalWrite(L2_GREEN, HIGH);
+      digitalWrite(L4_GREEN, HIGH);
+      digitalWrite(L1_RED,   HIGH);
+      digitalWrite(L3_RED,   HIGH);
+      break;
+
+    case EW_YELLOW:
+      digitalWrite(L2_YELLOW, HIGH);
+      digitalWrite(L4_YELLOW, HIGH);
+      digitalWrite(L1_RED,    HIGH);
+      digitalWrite(L3_RED,    HIGH);
+      break;
+
+    // EMERGENCY OVERRIDES
+    case OVERRIDE_1:
+      digitalWrite(L1_GREEN, HIGH);
+      digitalWrite(L2_RED,   HIGH);
+      digitalWrite(L3_RED,   HIGH);
+      digitalWrite(L4_RED,   HIGH);
+      break;
+
+    case OVERRIDE_2:
+      digitalWrite(L2_GREEN, HIGH);
+      digitalWrite(L1_RED,   HIGH);
+      digitalWrite(L3_RED,   HIGH);
+      digitalWrite(L4_RED,   HIGH);
+      break;
+
+    case OVERRIDE_3:
+      digitalWrite(L3_GREEN, HIGH);
+      digitalWrite(L1_RED,   HIGH);
+      digitalWrite(L2_RED,   HIGH);
+      digitalWrite(L4_RED,   HIGH);
+      break;
+
+    case OVERRIDE_4:
+      digitalWrite(L4_GREEN, HIGH);
+      digitalWrite(L1_RED,   HIGH);
+      digitalWrite(L2_RED,   HIGH);
+      digitalWrite(L3_RED,   HIGH);
+      break;
+  }
+}
+
+// ============================================================
+// TRANSITION
+// ============================================================
+
+void transitionTo(TrafficState newState) {
+  currentState  = newState;
+  stateStartTime = millis();
+  applyState(newState);
+}
+
+// ============================================================
+// FFT SIREN DETECTION (dual-method from filter code)
+// Uses majorPeak() for quick dominant frequency check,
+// then confirms with magnitude scan in siren band.
+// ============================================================
+
+double getSirenMagnitude(int micPin) {
+
+  // --- Sample collection (same as filter code) ---
+  for (int i = 0; i < SAMPLES; i++) {
+    unsigned long microseconds = micros();
+    vReal[i] = analogRead(micPin);
+    vImag[i] = 0;
+    while (micros() - microseconds < sampling_period_us) { }
+  }
+
+  // --- FFT processing ---
+  FFT.windowing(FFTWindow::Hamming, FFTDirection::Forward);
+  FFT.compute(FFTDirection::Forward);
+  FFT.complexToMagnitude();
+
+  // --- Quick check: is the dominant peak in siren range? ---
+  double peak = FFT.majorPeak();
+  if (peak < SIREN_LOW || peak > SIREN_HIGH) {
+    return 0.0;   // dominant frequency is outside siren band — skip
+  }
+
+  // --- Confirmed: scan band for highest magnitude ---
+  double peakMag = 0.0;
+  double freqRes = (double)SAMPLING_FREQUENCY / SAMPLES;
+
+  for (int i = 2; i < (SAMPLES / 2); i++) {
+    double frequency = i * freqRes;
+    if (frequency >= SIREN_LOW && frequency <= SIREN_HIGH) {
+      if (vReal[i] > peakMag) {
+        peakMag = vReal[i];
+      }
+    }
+  }
+
+  return peakMag;
+}
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup() {
+
+  pinMode(L1_RED,    OUTPUT);
+  pinMode(L1_YELLOW, OUTPUT);
+  pinMode(L1_GREEN,  OUTPUT);
+
+  pinMode(L2_RED,    OUTPUT);
+  pinMode(L2_YELLOW, OUTPUT);
+  pinMode(L2_GREEN,  OUTPUT);
+
+  pinMode(L3_RED,    OUTPUT);
+  pinMode(L3_YELLOW, OUTPUT);
+  pinMode(L3_GREEN,  OUTPUT);
+
+  pinMode(L4_RED,    OUTPUT);
+  pinMode(L4_YELLOW, OUTPUT);
+  pinMode(L4_GREEN,  OUTPUT);
+
+  pinMode(MIC1, INPUT);
+  pinMode(MIC2, INPUT);
+  pinMode(MIC3, INPUT);
+  pinMode(MIC4, INPUT);
+
+  sampling_period_us = round(1000000.0 / SAMPLING_FREQUENCY);
+
+  Serial.begin(115200);
+  Serial.println("ESP32 FFT Traffic System Ready");
+
+  transitionTo(NS_GREEN);
+}
+
+// ============================================================
+// LOOP
+// ============================================================
+
+void loop() {
+
+  unsigned long now     = millis();
+  unsigned long elapsed = now - stateStartTime;
+
+  // --------------------------------------------------------
+  // COOLDOWN
+  // --------------------------------------------------------
+
+  if (cooldownActive) {
+    if (now - cooldownStart >= COOLDOWN_TIME) {
+      cooldownActive = false;
+      Serial.println("Cooldown finished");
+    }
+  }
+
+  // --------------------------------------------------------
+  // FFT ANALYSIS — all four mics
+  // --------------------------------------------------------
+
+  double m1 = getSirenMagnitude(MIC1);
+  double m2 = getSirenMagnitude(MIC2);
+  double m3 = getSirenMagnitude(MIC3);
+  double m4 = getSirenMagnitude(MIC4);
+
+  Serial.print("M1:"); Serial.print(m1);
+  Serial.print(" M2:"); Serial.print(m2);
+  Serial.print(" M3:"); Serial.print(m3);
+  Serial.print(" M4:"); Serial.println(m4);
+
+  // --------------------------------------------------------
+  // FIND LOUDEST SIREN
+  // --------------------------------------------------------
+
+  if (!cooldownActive) {
+
+    double maxMag = SIREN_THRESHOLD;
+    int    lane   = 0;
+
+    if (m1 > maxMag) { maxMag = m1; lane = 1; }
+    if (m2 > maxMag) { maxMag = m2; lane = 2; }
+    if (m3 > maxMag) { maxMag = m3; lane = 3; }
+    if (m4 > maxMag) { maxMag = m4; lane = 4; }
+
+    if (lane > 0) {
+      Serial.print("SIREN DETECTED IN LANE ");
+      Serial.println(lane);
+
+      cooldownActive = true;
+      cooldownStart  = now;
+
+      switch (lane) {
+        case 1: transitionTo(OVERRIDE_1); break;
+        case 2: transitionTo(OVERRIDE_2); break;
+        case 3: transitionTo(OVERRIDE_3); break;
+        case 4: transitionTo(OVERRIDE_4); break;
+      }
+    }
+  }
+
+  // --------------------------------------------------------
+  // REFRESH ELAPSED AFTER FFT PROCESSING
+  // --------------------------------------------------------
+
+  now     = millis();
+  elapsed = now - stateStartTime;
+
+  // --------------------------------------------------------
+  // STATE MACHINE
+  // --------------------------------------------------------
+
+  switch (currentState) {
+
+    case NS_GREEN:
+      if (elapsed >= GREEN_DURATION)   transitionTo(NS_YELLOW);
+      break;
+
+    case NS_YELLOW:
+      if (elapsed >= YELLOW_DURATION)  transitionTo(ALL_RED_1);
+      break;
+
+    case ALL_RED_1:
+      if (elapsed >= ALL_RED_DURATION) transitionTo(EW_GREEN);
+      break;
+
+    case EW_GREEN:
+      if (elapsed >= GREEN_DURATION)   transitionTo(EW_YELLOW);
+      break;
+
+    case EW_YELLOW:
+      if (elapsed >= YELLOW_DURATION)  transitionTo(ALL_RED_2);
+      break;
+
+    case ALL_RED_2:
+      if (elapsed >= ALL_RED_DURATION) transitionTo(NS_GREEN);
+      break;
+
+    // EMERGENCY STATES
+    case OVERRIDE_1:
+    case OVERRIDE_2:
+    case OVERRIDE_3:
+    case OVERRIDE_4:
+      if (elapsed >= EMERGENCY_TIME) {
+        if (currentState == OVERRIDE_1 || currentState == OVERRIDE_3)
+          transitionTo(NS_YELLOW);
+        else
+          transitionTo(EW_YELLOW);
+      }
+      break;
+  }
+}

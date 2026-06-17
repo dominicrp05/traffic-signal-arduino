@@ -1,0 +1,257 @@
+/*
+  ============================================================
+  4-Lane AI Traffic Signal — ESP32
+  Receives siren detection from PC via Serial
+  Compares 4 KY-038 mic levels → loudest lane gets green
+  Paired lanes: N+S together, E+W together
+  ============================================================
+  Lane 1 North: R=13, Y=12,  G=14  | KY-038 AO → GPIO36
+  Lane 2 East:  R=27, Y=26,  G=25  | KY-038 AO → GPIO39
+  Lane 3 South: R=33, Y=32,  G=23  | KY-038 AO → GPIO34
+  Lane 4 West:  R=22, Y=21,  G=19  | KY-038 AO → GPIO35
+  ============================================================
+*/
+
+// ── Lane Pins ─────────────────────────────────────────────
+const int L1_RED=13, L1_YELLOW=12, L1_GREEN=14;
+const int L2_RED=27, L2_YELLOW=26, L2_GREEN=25;
+const int L3_RED=33, L3_YELLOW=32, L3_GREEN=23;
+const int L4_RED=22, L4_YELLOW=21, L4_GREEN=19;
+
+// ── KY-038 Analog Pins ────────────────────────────────────
+#define MIC1  36   // Lane 1 North
+#define MIC2  39   // Lane 2 East
+#define MIC3  34   // Lane 3 South
+#define MIC4  35   // Lane 4 West
+
+// ── Timing ────────────────────────────────────────────────
+const unsigned long GREEN_DURATION   = 5000;
+const unsigned long YELLOW_DURATION  = 2000;
+const unsigned long ALL_RED_DURATION = 1000;
+const unsigned long SIREN_GREEN_TIME = 6000;
+const unsigned long COOLDOWN_TIME    = 15000;
+
+// ── States ────────────────────────────────────────────────
+enum TrafficState {
+  NS_GREEN, NS_YELLOW, ALL_RED_1,
+  EW_GREEN, EW_YELLOW, ALL_RED_2,
+  OVERRIDE_1, OVERRIDE_2,
+  OVERRIDE_3, OVERRIDE_4
+};
+
+const char* stateNames[] = {
+  "NS_GREEN","NS_YELLOW","ALL_RED_1",
+  "EW_GREEN","EW_YELLOW","ALL_RED_2",
+  "OVERRIDE_1(N)","OVERRIDE_2(E)",
+  "OVERRIDE_3(S)","OVERRIDE_4(W)"
+};
+
+TrafficState currentState = NS_GREEN;
+unsigned long stateStartTime = 0;
+unsigned long cooldownStart  = 0;
+bool cooldownActive          = false;
+
+// ── LED helpers ───────────────────────────────────────────
+void allOff() {
+  digitalWrite(L1_RED,LOW); digitalWrite(L1_YELLOW,LOW); digitalWrite(L1_GREEN,LOW);
+  digitalWrite(L2_RED,LOW); digitalWrite(L2_YELLOW,LOW); digitalWrite(L2_GREEN,LOW);
+  digitalWrite(L3_RED,LOW); digitalWrite(L3_YELLOW,LOW); digitalWrite(L3_GREEN,LOW);
+  digitalWrite(L4_RED,LOW); digitalWrite(L4_YELLOW,LOW); digitalWrite(L4_GREEN,LOW);
+}
+
+void allRed() {
+  allOff();
+  digitalWrite(L1_RED,HIGH); digitalWrite(L2_RED,HIGH);
+  digitalWrite(L3_RED,HIGH); digitalWrite(L4_RED,HIGH);
+}
+
+void applyState(TrafficState s) {
+  allOff();
+  switch(s) {
+    case ALL_RED_1: case ALL_RED_2:
+      allRed(); break;
+
+    case NS_GREEN:
+      digitalWrite(L1_GREEN,HIGH); digitalWrite(L3_GREEN,HIGH);
+      digitalWrite(L2_RED,HIGH);   digitalWrite(L4_RED,HIGH);   break;
+    case NS_YELLOW:
+      digitalWrite(L1_YELLOW,HIGH); digitalWrite(L3_YELLOW,HIGH);
+      digitalWrite(L2_RED,HIGH);    digitalWrite(L4_RED,HIGH);   break;
+
+    case EW_GREEN:
+      digitalWrite(L2_GREEN,HIGH); digitalWrite(L4_GREEN,HIGH);
+      digitalWrite(L1_RED,HIGH);   digitalWrite(L3_RED,HIGH);   break;
+    case EW_YELLOW:
+      digitalWrite(L2_YELLOW,HIGH); digitalWrite(L4_YELLOW,HIGH);
+      digitalWrite(L1_RED,HIGH);    digitalWrite(L3_RED,HIGH);   break;
+
+    case OVERRIDE_1:
+      digitalWrite(L1_GREEN,HIGH);
+      digitalWrite(L2_RED,HIGH); digitalWrite(L3_RED,HIGH); digitalWrite(L4_RED,HIGH);
+      break;
+    case OVERRIDE_2:
+      digitalWrite(L2_GREEN,HIGH);
+      digitalWrite(L1_RED,HIGH); digitalWrite(L3_RED,HIGH); digitalWrite(L4_RED,HIGH);
+      break;
+    case OVERRIDE_3:
+      digitalWrite(L3_GREEN,HIGH);
+      digitalWrite(L1_RED,HIGH); digitalWrite(L2_RED,HIGH); digitalWrite(L4_RED,HIGH);
+      break;
+    case OVERRIDE_4:
+      digitalWrite(L4_GREEN,HIGH);
+      digitalWrite(L1_RED,HIGH); digitalWrite(L2_RED,HIGH); digitalWrite(L3_RED,HIGH);
+      break;
+  }
+}
+
+void transitionTo(TrafficState newState) {
+  currentState   = newState;
+  stateStartTime = millis();
+  applyState(newState);
+  Serial.print("[State] → ");
+  Serial.println(stateNames[newState]);
+}
+
+bool isLaneGreen(int lane) {
+  if(lane==1) return(currentState==NS_GREEN||currentState==OVERRIDE_1);
+  if(lane==2) return(currentState==EW_GREEN||currentState==OVERRIDE_2);
+  if(lane==3) return(currentState==NS_GREEN||currentState==OVERRIDE_3);
+  if(lane==4) return(currentState==EW_GREEN||currentState==OVERRIDE_4);
+  return false;
+}
+
+TrafficState getOverride(int lane) {
+  if(lane==1) return OVERRIDE_1;
+  if(lane==2) return OVERRIDE_2;
+  if(lane==3) return OVERRIDE_3;
+  return OVERRIDE_4;
+}
+
+// ── Find loudest mic lane ─────────────────────────────────
+// Takes multiple readings and averages for accuracy
+int getLoudestLane() {
+  long v1=0, v2=0, v3=0, v4=0;
+
+  // Take 10 readings and average
+  for(int i=0; i<10; i++) {
+    v1 += analogRead(MIC1);
+    v2 += analogRead(MIC2);
+    v3 += analogRead(MIC3);
+    v4 += analogRead(MIC4);
+    delay(10);
+  }
+  v1/=10; v2/=10; v3/=10; v4/=10;
+
+  Serial.print("Mic levels → M1:"); Serial.print(v1);
+  Serial.print(" M2:"); Serial.print(v2);
+  Serial.print(" M3:"); Serial.print(v3);
+  Serial.print(" M4:"); Serial.println(v4);
+
+  long maxVal=v1; int lane=1;
+  if(v2>maxVal){maxVal=v2; lane=2;}
+  if(v3>maxVal){maxVal=v3; lane=3;}
+  if(v4>maxVal){maxVal=v4; lane=4;}
+
+  Serial.print("Loudest lane: "); Serial.println(lane);
+  return lane;
+}
+
+// ── Handle serial commands from PC ───────────────────────
+void handleSerial() {
+  if(Serial.available()) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+
+    Serial.print("[PC Command] "); Serial.println(cmd);
+
+    if(cmd.startsWith("SIREN:")) {
+      // PC detected siren — find loudest lane
+      float confidence = cmd.substring(6).toFloat();
+      Serial.print("Siren confirmed by AI! Confidence: ");
+      Serial.println(confidence);
+
+      if(!cooldownActive) {
+        int lane = getLoudestLane();
+
+        if(!isLaneGreen(lane)) {
+          Serial.print("🚨 EMERGENCY! Lane ");
+          Serial.print(lane); Serial.println(" → GREEN");
+
+          cooldownActive = true;
+          cooldownStart  = millis();
+          transitionTo(getOverride(lane));
+
+        } else {
+          Serial.println("Lane already green — no change.");
+        }
+      } else {
+        Serial.println("Cooldown active — siren ignored.");
+      }
+
+    } else if(cmd == "COOLDOWN_OVER") {
+      cooldownActive = false;
+      Serial.println("Cooldown reset by PC.");
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(L1_RED,OUTPUT); pinMode(L1_YELLOW,OUTPUT); pinMode(L1_GREEN,OUTPUT);
+  pinMode(L2_RED,OUTPUT); pinMode(L2_YELLOW,OUTPUT); pinMode(L2_GREEN,OUTPUT);
+  pinMode(L3_RED,OUTPUT); pinMode(L3_YELLOW,OUTPUT); pinMode(L3_GREEN,OUTPUT);
+  pinMode(L4_RED,OUTPUT); pinMode(L4_YELLOW,OUTPUT); pinMode(L4_GREEN,OUTPUT);
+
+  Serial.println("══════════════════════════════════");
+  Serial.println("  4-Lane AI Traffic Signal ESP32  ");
+  Serial.println("  Waiting for PC siren detection  ");
+  Serial.println("══════════════════════════════════");
+
+  allRed();
+  delay(2000);
+  transitionTo(NS_GREEN);
+}
+
+// ─────────────────────────────────────────────────────────
+void loop() {
+  unsigned long now     = millis();
+  unsigned long elapsed = now - stateStartTime;
+
+  // STEP 1 — Handle cooldown
+  if(cooldownActive) {
+    if(now - cooldownStart >= COOLDOWN_TIME) {
+      cooldownActive = false;
+      Serial.println("Cooldown over.");
+    }
+  }
+
+  // STEP 2 — Check serial commands from PC
+  handleSerial();
+
+  // STEP 3 — State machine
+  switch(currentState) {
+    case NS_GREEN:
+      if(elapsed>=GREEN_DURATION)   transitionTo(NS_YELLOW);  break;
+    case NS_YELLOW:
+      if(elapsed>=YELLOW_DURATION)  transitionTo(ALL_RED_1);  break;
+    case ALL_RED_1:
+      if(elapsed>=ALL_RED_DURATION) transitionTo(EW_GREEN);   break;
+    case EW_GREEN:
+      if(elapsed>=GREEN_DURATION)   transitionTo(EW_YELLOW);  break;
+    case EW_YELLOW:
+      if(elapsed>=YELLOW_DURATION)  transitionTo(ALL_RED_2);  break;
+    case ALL_RED_2:
+      if(elapsed>=ALL_RED_DURATION) transitionTo(NS_GREEN);   break;
+
+    case OVERRIDE_1:
+      if(elapsed>=SIREN_GREEN_TIME) transitionTo(NS_YELLOW);  break;
+    case OVERRIDE_2:
+      if(elapsed>=SIREN_GREEN_TIME) transitionTo(EW_YELLOW);  break;
+    case OVERRIDE_3:
+      if(elapsed>=SIREN_GREEN_TIME) transitionTo(NS_YELLOW);  break;
+    case OVERRIDE_4:
+      if(elapsed>=SIREN_GREEN_TIME) transitionTo(EW_YELLOW);  break;
+  }
+}

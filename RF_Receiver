@@ -1,0 +1,311 @@
+/*
+  ============================================================
+  V3: HYBRID RF-AI TRAFFIC SIGNAL — ESP32 RECEIVER NODE
+  Features: Wave Variance Acoustic Logic, Safe Transitions, 
+  NRF24L01 2.4GHz Wake-Up, PC Serial AI Override, and 
+  Dynamic Audio Fade-Out (RESUME_NORMAL).
+  ============================================================
+*/
+
+#include <SPI.h>
+#include <RF24.h>
+
+// ── NRF24L01 Setup ────────────────────────────────────────
+RF24 radio(4, 5); // CE on GPIO 4, CSN on GPIO 5
+const byte address[6] = "00001"; // Must match transmitter exactly
+
+// ── Pins ──────────────────────────────────────────────────
+// ── LED Pins (Updated to free up VSPI for Radio) ──────────
+const int L1_RED=2, L1_YELLOW=21, L1_GREEN=22;  // North
+const int L2_RED=12, L2_YELLOW=13, L2_GREEN=14; // East
+const int L3_RED=15, L3_YELLOW=16, L3_GREEN=17; // South
+const int L4_RED=25, L4_YELLOW=26, L4_GREEN=27; // West
+
+// ── NRF24L01 Radio Pins (Do not change these) ─────────────
+// CE = 4, CSN = 5, SCK = 18, MISO = 19, MOSI = 23
+
+#define MIC1  36   // North
+#define MIC2  39   // East
+#define MIC3  34   // South
+#define MIC4  35   // West
+
+// ── Timing & Variables ────────────────────────────────────
+const unsigned long GREEN_DURATION   = 5000;
+const unsigned long YELLOW_DURATION  = 2000;
+const unsigned long ALL_RED_DURATION = 1000;
+const unsigned long SIREN_GREEN_TIME = 15000; 
+const unsigned long COOLDOWN_TIME    = 15000;
+
+enum TrafficState {
+  NS_GREEN, NS_YELLOW, ALL_RED_1,
+  EW_GREEN, EW_YELLOW, ALL_RED_2,
+  OVERRIDE_1, OVERRIDE_2,
+  OVERRIDE_3, OVERRIDE_4
+};
+
+const char* stateNames[] = {
+  "NS_GREEN","NS_YELLOW","ALL_RED_1",
+  "EW_GREEN","EW_YELLOW","ALL_RED_2",
+  "OVERRIDE_1(N)","OVERRIDE_2(E)",
+  "OVERRIDE_3(S)","OVERRIDE_4(W)"
+};
+
+volatile TrafficState currentState = NS_GREEN;
+volatile unsigned long stateStartTime = 0;
+volatile unsigned long cooldownStart  = 0;
+volatile bool cooldownActive          = false;
+volatile bool isArmed                 = false;
+volatile int activeEmergencyLane      = 0; 
+
+TaskHandle_t Task0_Core;
+TaskHandle_t Task1_Core;
+
+// ── LED Helpers ───────────────────────────────────────────
+void allOff() {
+  digitalWrite(L1_RED,LOW); digitalWrite(L1_YELLOW,LOW); digitalWrite(L1_GREEN,LOW);
+  digitalWrite(L2_RED,LOW); digitalWrite(L2_YELLOW,LOW); digitalWrite(L2_GREEN,LOW);
+  digitalWrite(L3_RED,LOW); digitalWrite(L3_YELLOW,LOW); digitalWrite(L3_GREEN,LOW);
+  digitalWrite(L4_RED,LOW); digitalWrite(L4_YELLOW,LOW); digitalWrite(L4_GREEN,LOW);
+}
+
+void allRed() {
+  allOff();
+  digitalWrite(L1_RED,HIGH); digitalWrite(L2_RED,HIGH);
+  digitalWrite(L3_RED,HIGH); digitalWrite(L4_RED,HIGH);
+}
+
+void applyState(TrafficState s) {
+  allOff();
+  switch(s) {
+    case ALL_RED_1: case ALL_RED_2:
+      allRed(); break;
+    case NS_GREEN:
+      digitalWrite(L1_GREEN,HIGH); digitalWrite(L3_GREEN,HIGH);
+      digitalWrite(L2_RED,HIGH);   digitalWrite(L4_RED,HIGH);   break;
+    case NS_YELLOW:
+      digitalWrite(L1_YELLOW,HIGH); digitalWrite(L3_YELLOW,HIGH);
+      digitalWrite(L2_RED,HIGH);    digitalWrite(L4_RED,HIGH);   break;
+    case EW_GREEN:
+      digitalWrite(L2_GREEN,HIGH); digitalWrite(L4_GREEN,HIGH);
+      digitalWrite(L1_RED,HIGH);   digitalWrite(L3_RED,HIGH);   break;
+    case EW_YELLOW:
+      digitalWrite(L2_YELLOW,HIGH); digitalWrite(L4_YELLOW,HIGH);
+      digitalWrite(L1_RED,HIGH);    digitalWrite(L3_RED,HIGH);   break;
+    case OVERRIDE_1:
+      digitalWrite(L1_GREEN,HIGH);
+      digitalWrite(L2_RED,HIGH); digitalWrite(L3_RED,HIGH); digitalWrite(L4_RED,HIGH); break;
+    case OVERRIDE_2:
+      digitalWrite(L2_GREEN,HIGH);
+      digitalWrite(L1_RED,HIGH); digitalWrite(L3_RED,HIGH); digitalWrite(L4_RED,HIGH); break;
+    case OVERRIDE_3:
+      digitalWrite(L3_GREEN,HIGH);
+      digitalWrite(L1_RED,HIGH); digitalWrite(L2_RED,HIGH); digitalWrite(L4_RED,HIGH); break;
+    case OVERRIDE_4:
+      digitalWrite(L4_GREEN,HIGH);
+      digitalWrite(L1_RED,HIGH); digitalWrite(L2_RED,HIGH); digitalWrite(L3_RED,HIGH); break;
+  }
+}
+
+void transitionTo(TrafficState newState) {
+  currentState   = newState;
+  stateStartTime = millis();
+  applyState(newState);
+  Serial.print("[State] → ");
+  Serial.println(stateNames[newState]);
+}
+
+bool isLaneGreen(int lane) {
+  if(lane==1) return(currentState==NS_GREEN||currentState==OVERRIDE_1);
+  if(lane==2) return(currentState==EW_GREEN||currentState==OVERRIDE_2);
+  if(lane==3) return(currentState==NS_GREEN||currentState==OVERRIDE_3);
+  if(lane==4) return(currentState==EW_GREEN||currentState==OVERRIDE_4);
+  return false;
+}
+
+TrafficState getOverride(int lane) {
+  if(lane==1) return OVERRIDE_1;
+  if(lane==2) return OVERRIDE_2;
+  if(lane==3) return OVERRIDE_3;
+  return OVERRIDE_4;
+}
+
+// ── Wave Variance Logic ───────────────────────────────────
+int getLoudestLane() {
+  int minVals[4] = {4095, 4095, 4095, 4095};
+  int maxVals[4] = {0, 0, 0, 0};
+  
+  unsigned long startSample = millis();
+  while(millis() - startSample < 200) {
+    int r1 = analogRead(MIC1); int r2 = analogRead(MIC2);
+    int r3 = analogRead(MIC3); int r4 = analogRead(MIC4);
+
+    if(r1 < minVals[0]) minVals[0] = r1; if(r1 > maxVals[0]) maxVals[0] = r1;
+    if(r2 < minVals[1]) minVals[1] = r2; if(r2 > maxVals[1]) maxVals[1] = r2;
+    if(r3 < minVals[2]) minVals[2] = r3; if(r3 > maxVals[2]) maxVals[2] = r3;
+    if(r4 < minVals[3]) minVals[3] = r4; if(r4 > maxVals[3]) maxVals[3] = r4;
+  }
+
+  int var1 = maxVals[0] - minVals[0];
+  int var2 = maxVals[1] - minVals[1];
+  int var3 = maxVals[2] - minVals[2];
+  int var4 = maxVals[3] - minVals[3];
+
+  Serial.printf("Variance → M1:%d M2:%d M3:%d M4:%d\n", var1, var2, var3, var4);
+
+  int maxVar = var1; int lane = 1;
+  if(var2 > maxVar){ maxVar = var2; lane = 2; }
+  if(var3 > maxVar){ maxVar = var3; lane = 3; }
+  if(var4 > maxVar){ maxVar = var4; lane = 4; }
+
+  return lane;
+}
+
+// ── Serial Command Handler ────────────────────────────────
+void handleSerial() {
+  if(Serial.available()) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+
+    if(cmd.startsWith("SIREN:")) {
+      if(!cooldownActive) {
+        int targetLane = getLoudestLane();
+
+        if(!isLaneGreen(targetLane)) {
+          Serial.print("🚨 EMERGENCY! Routing to Lane "); Serial.println(targetLane);
+          cooldownActive = true;
+          cooldownStart  = millis();
+          activeEmergencyLane = targetLane; 
+
+          if((targetLane == 1 || targetLane == 3) && currentState == EW_GREEN) {
+            Serial.println("[Safety] Forcing E/W to YELLOW...");
+            transitionTo(EW_YELLOW); 
+          } 
+          else if((targetLane == 2 || targetLane == 4) && currentState == NS_GREEN) {
+            Serial.println("[Safety] Forcing N/S to YELLOW...");
+            transitionTo(NS_YELLOW);
+          } 
+          else {
+            transitionTo(getOverride(targetLane));
+          }
+        } else {
+          Serial.println("Lane already green — extending duration.");
+        }
+      }
+    }
+    else if(cmd == "RESUME_NORMAL") {
+      Serial.println("✅ PC commanded normal traffic resume. Ending override early.");
+      cooldownActive = false;
+      isArmed = false;
+      activeEmergencyLane = 0;
+      
+      if(currentState == OVERRIDE_1 || currentState == OVERRIDE_3) {
+        transitionTo(NS_YELLOW);
+      } 
+      else if(currentState == OVERRIDE_2 || currentState == OVERRIDE_4) {
+        transitionTo(EW_YELLOW);
+      }
+    }
+  }
+}
+
+// ── CORE 0: Network & AI Command ──────────────────────────
+void core0Task(void * pvParameters) {
+  for(;;) {
+    // 1. Listen for NRF24L01 Wake-Up Packet
+    if (radio.available() && !isArmed) {
+      char text[32] = "";
+      radio.read(&text, sizeof(text));
+      
+      if (String(text) == "AMBULANCE") {
+        isArmed = true;
+        Serial.println("RF TRIGGER: Ambulance Approaching! System Armed.");
+      }
+    }
+    
+    // 2. Read PC Serial Command (Python AI)
+    handleSerial(); 
+    
+    vTaskDelay(10 / portTICK_PERIOD_MS); 
+  }
+}
+
+// ── CORE 1: Traffic State Machine ─────────────────────────
+void core1Task(void * pvParameters) {
+  for(;;) {
+    unsigned long now = millis();
+    unsigned long elapsed = now - stateStartTime;
+    
+    if(cooldownActive && (now - cooldownStart >= COOLDOWN_TIME)) {
+      cooldownActive = false;
+      isArmed = false;
+      activeEmergencyLane = 0;
+      Serial.println("Cooldown finished. Normal ops resumed.");
+    }
+
+    switch(currentState) {
+      case NS_GREEN:
+        if(elapsed>=GREEN_DURATION)   transitionTo(NS_YELLOW);  break;
+      case NS_YELLOW:
+        if(elapsed>=YELLOW_DURATION)  transitionTo(ALL_RED_1);  break;
+      case ALL_RED_1:
+        if(elapsed>=ALL_RED_DURATION) {
+          if(activeEmergencyLane > 0) transitionTo(getOverride(activeEmergencyLane));
+          else transitionTo(EW_GREEN);
+        }
+        break;
+      case EW_GREEN:
+        if(elapsed>=GREEN_DURATION)   transitionTo(EW_YELLOW);  break;
+      case EW_YELLOW:
+        if(elapsed>=YELLOW_DURATION)  transitionTo(ALL_RED_2);  break;
+      case ALL_RED_2:
+        if(elapsed>=ALL_RED_DURATION) {
+          if(activeEmergencyLane > 0) transitionTo(getOverride(activeEmergencyLane));
+          else transitionTo(NS_GREEN);
+        }
+        break;
+        
+      case OVERRIDE_1:
+        if(elapsed>=SIREN_GREEN_TIME) transitionTo(NS_YELLOW);  break;
+      case OVERRIDE_2:
+        if(elapsed>=SIREN_GREEN_TIME) transitionTo(EW_YELLOW);  break;
+      case OVERRIDE_3:
+        if(elapsed>=SIREN_GREEN_TIME) transitionTo(NS_YELLOW);  break;
+      case OVERRIDE_4:
+        if(elapsed>=SIREN_GREEN_TIME) transitionTo(EW_YELLOW);  break;
+    }
+    
+    vTaskDelay(10 / portTICK_PERIOD_MS); 
+  }
+}
+
+// ──────────────────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+  
+  pinMode(L1_RED,OUTPUT); pinMode(L1_YELLOW,OUTPUT); pinMode(L1_GREEN,OUTPUT);
+  pinMode(L2_RED,OUTPUT); pinMode(L2_YELLOW,OUTPUT); pinMode(L2_GREEN,OUTPUT);
+  pinMode(L3_RED,OUTPUT); pinMode(L3_YELLOW,OUTPUT); pinMode(L3_GREEN,OUTPUT);
+  pinMode(L4_RED,OUTPUT); pinMode(L4_YELLOW,OUTPUT); pinMode(L4_GREEN,OUTPUT);
+
+  allRed();
+  delay(1000);
+
+  // Boot up NRF24L01
+  if (!radio.begin()) {
+    Serial.println("NRF24L01 hardware not responding! Check SPI wiring.");
+  } else {
+    radio.openReadingPipe(0, address);
+    radio.setPALevel(RF24_PA_MIN);
+    radio.startListening();
+    Serial.println("NRF24L01 initialized successfully.");
+  }
+
+  xTaskCreatePinnedToCore(core0Task, "Task0", 10000, NULL, 1, &Task0_Core, 0);
+  xTaskCreatePinnedToCore(core1Task, "Task1", 10000, NULL, 1, &Task1_Core, 1);
+
+  transitionTo(NS_GREEN);
+}
+
+void loop() {
+  vTaskDelete(NULL); 
+}
